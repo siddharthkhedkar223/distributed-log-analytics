@@ -1,0 +1,290 @@
+version: "3.8"
+
+# =============================================================================
+# Distributed Log Analytics Pipeline
+# Stack: Filebeat → Logstash → Elasticsearch (2-node HA cluster) → Kibana
+#
+# Key design decisions:
+#   1. Filebeat decouples log SHIPPING from application code
+#   2. Logstash centralises log TRANSFORMATION (grok, enrichment, routing)
+#   3. Two Elasticsearch nodes provide shard replication & fault tolerance
+#   4. All containers have hard memory limits to prevent host OOM cascades
+# =============================================================================
+
+networks:
+  observability-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  es-data-01:
+    driver: local
+  es-data-02:
+    driver: local
+  kibana-data:
+    driver: local
+  logstash-data:
+    driver: local
+  filebeat-data:
+    driver: local
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch Node 1  (master-eligible + data)
+  # ---------------------------------------------------------------------------
+  elasticsearch-01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch-01
+    hostname: elasticsearch-01
+    environment:
+      - node.name=elasticsearch-01
+      - cluster.name=log-analytics-cluster
+      - discovery.seed_hosts=elasticsearch-02
+      - cluster.initial_master_nodes=elasticsearch-01,elasticsearch-02
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=false        # disable for local dev; enable + TLS in prod
+      - xpack.monitoring.collection.enabled=true
+      # JVM heap = 50 % of container limit (Elastic best-practice)
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 1g        # hard cap — prevents OOM-kill cascade on shared hosts
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+    volumes:
+      - es-data-01:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - observability-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch Node 2  (master-eligible + data) — quorum & HA
+  # ---------------------------------------------------------------------------
+  elasticsearch-02:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch-02
+    hostname: elasticsearch-02
+    environment:
+      - node.name=elasticsearch-02
+      - cluster.name=log-analytics-cluster
+      - discovery.seed_hosts=elasticsearch-01
+      - cluster.initial_master_nodes=elasticsearch-01,elasticsearch-02
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=false
+      - xpack.monitoring.collection.enabled=true
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+    volumes:
+      - es-data-02:/usr/share/elasticsearch/data
+    networks:
+      - observability-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Logstash — central transformation & enrichment layer
+  # Receives Beats events → parses, normalises, tags → routes to ES index
+  # ---------------------------------------------------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    container_name: logstash
+    hostname: logstash
+    volumes:
+      - ./logstash/pipeline/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - logstash-data:/usr/share/logstash/data
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.75"
+        reservations:
+          memory: 256m
+    ports:
+      - "5044:5044"   # Beats input
+      - "9600:9600"   # Logstash monitoring API
+    networks:
+      - observability-net
+    depends_on:
+      elasticsearch-01:
+        condition: service_healthy
+      elasticsearch-02:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9600 > /dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kibana — dashboards + KQL search + alerting UI
+  # ---------------------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: kibana
+    hostname: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=["http://elasticsearch-01:9200","http://elasticsearch-02:9200"]
+      - SERVER_NAME=kibana
+      - MONITORING_ENABLED=true
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: "0.5"
+        reservations:
+          memory: 384m
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+    ports:
+      - "5601:5601"
+    networks:
+      - observability-net
+    depends_on:
+      elasticsearch-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status > /dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Filebeat — lightweight log shipper
+  # Tails Docker container stdout via /var/lib/docker/containers/, enriches
+  # with Docker metadata, ships to Logstash. Decouples collection from processing.
+  # ---------------------------------------------------------------------------
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.4
+    container_name: filebeat
+    hostname: filebeat
+    user: root
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - filebeat-data:/usr/share/filebeat/data
+    deploy:
+      resources:
+        limits:
+          memory: 128m      # Filebeat is intentionally lightweight (~40 MB typical)
+          cpus: "0.25"
+    networks:
+      - observability-net
+    depends_on:
+      logstash:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===========================================================================
+  # SIMULATED MICROSERVICES
+  # Each service emits structured JSON to stdout. Filebeat picks them up
+  # automatically via Docker log-driver autodiscovery.
+  # ===========================================================================
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+    container_name: auth-service
+    environment:
+      - SERVICE_NAME=auth-service
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
+    labels:
+      co.elastic.logs/enabled: "true"
+      co.elastic.logs/json.keys_under_root: "true"
+      co.elastic.logs/json.overwrite_keys: "true"
+      service.name: "auth-service"
+    networks:
+      - observability-net
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: ./services/order-service
+    container_name: order-service
+    environment:
+      - SERVICE_NAME=order-service
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
+    labels:
+      co.elastic.logs/enabled: "true"
+      co.elastic.logs/json.keys_under_root: "true"
+      co.elastic.logs/json.overwrite_keys: "true"
+      service.name: "order-service"
+    networks:
+      - observability-net
+    restart: unless-stopped
+
+  inventory-service:
+    build:
+      context: ./services/inventory-service
+    container_name: inventory-service
+    environment:
+      - SERVICE_NAME=inventory-service
+      - LOG_LEVEL=WARN
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
+    labels:
+      co.elastic.logs/enabled: "true"
+      co.elastic.logs/json.keys_under_root: "true"
+      co.elastic.logs/json.overwrite_keys: "true"
+      service.name: "inventory-service"
+    networks:
+      - observability-net
+    restart: unless-stopped
